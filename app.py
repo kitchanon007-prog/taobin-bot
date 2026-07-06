@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import base64
 import datetime
@@ -22,15 +23,16 @@ from apscheduler.triggers.cron import CronTrigger
 app = Flask(__name__)
 
 # ============================================================
-#  CONFIGURATION — ค่าเหล่านี้ตั้งผ่าน Environment Variables
+#  CONFIGURATION
 # ============================================================
 LINE_CHANNEL_SECRET       = os.environ.get('LINE_CHANNEL_SECRET', '')
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '')
 ANTHROPIC_API_KEY         = os.environ.get('ANTHROPIC_API_KEY', '')
 REQUIRED_PHOTOS           = int(os.environ.get('REQUIRED_PHOTOS', '20'))
 
-DATA_FILE   = 'submissions.json'
-GROUPS_FILE = 'groups.json'
+DATA_FILE    = 'submissions.json'
+GROUPS_FILE  = 'groups.json'
+SESSION_FILE = 'sessions.json'   # เก็บ session ปัจจุบันของแต่ละคน
 
 # ============================================================
 #  INIT
@@ -54,16 +56,34 @@ def save_json(path, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 def get_today():
-    """วันที่ตามเวลาประเทศไทย (UTC+7)"""
     tz = datetime.timezone(datetime.timedelta(hours=7))
     return datetime.datetime.now(tz).strftime('%Y-%m-%d')
+
+
+# ============================================================
+#  PARSE SUBMISSION TEXT
+#  รูปแบบ: "NPT1 200243 5 ถัง"
+#  → route=NPT1, machine=200243, tanks=5
+# ============================================================
+def parse_submission(text):
+    """
+    รูปแบบที่รองรับ:
+      NPT1 200243 5 ถัง
+      NPT1 200243 5ถัง
+      npt1 200243 5 ถัง
+    คืนค่า (route, machine, tanks) หรือ None ถ้าไม่ตรง
+    """
+    pattern = r'^([A-Za-z0-9]+)\s+(\d{6})\s+(\d+)\s*ถัง'
+    m = re.match(pattern, text.strip(), re.IGNORECASE)
+    if m:
+        return m.group(1).upper(), m.group(2), int(m.group(3))
+    return None
 
 
 # ============================================================
 #  LINE API HELPERS
 # ============================================================
 def get_user_name(user_id, group_id=None):
-    """ดึงชื่อสมาชิกจาก LINE"""
     try:
         with ApiClient(line_config) as api_client:
             api = MessagingApi(api_client)
@@ -76,7 +96,6 @@ def get_user_name(user_id, group_id=None):
         return user_id
 
 def download_image(message_id):
-    """Download รูปจาก LINE"""
     url = f"https://api-data.line.me/v2/bot/message/{message_id}/content"
     headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
     with httpx.Client(timeout=30) as client:
@@ -103,7 +122,6 @@ def send_push(to, text):
 #  IMAGE ANALYSIS
 # ============================================================
 def analyze_image(image_data):
-    """วิเคราะห์รูปด้วย Claude — ตรวจว่าเป็นรูปหลักฐานการทำงานหรือไม่"""
     try:
         img_b64 = base64.standard_b64encode(image_data).decode('utf-8')
         msg = anthropic_client.messages.create(
@@ -163,40 +181,69 @@ def on_join(event):
         save_json(GROUPS_FILE, groups)
         send_reply(event.reply_token,
             f"✅ Taobin Bot พร้อมแล้วครับ!\n"
-            f"📌 Group ID: {gid}\n"
-            f"🕗 จะสรุปรายงานทุกวัน 20:00 น. อัตโนมัติ\n"
-            f"💬 พิมพ์ /report เพื่อดูรายงานตอนนี้ได้เลยครับ"
+            f"📌 Group ID: {gid}\n\n"
+            f"📝 วิธีส่งงาน:\n"
+            f"1. พิมพ์: [สาย] [เลขตู้ 6 หลัก] [จำนวน] ถัง\n"
+            f"   ตัวอย่าง: NPT1 200243 5 ถัง\n"
+            f"2. ส่งรูปหลักฐาน {REQUIRED_PHOTOS} รูป\n\n"
+            f"🕗 Bot สรุปรายงานทุกวัน 20:00 น. อัตโนมัติ\n"
+            f"💬 พิมพ์ /report เพื่อดูรายงานทันที"
         )
 
 
 # ============================================================
-#  EVENT: ข้อความ (Commands)
+#  EVENT: ข้อความ
 # ============================================================
 @handler.add(MessageEvent, message=TextMessageContent)
 def on_text(event):
-    text = event.message.text.strip().lower()
+    if event.source.type != 'group':
+        return
 
+    text     = event.message.text.strip()
+    user_id  = event.source.user_id
+    group_id = event.source.group_id
+
+    # --- Commands ---
     if text == '/id':
-        if event.source.type == 'group':
-            send_reply(event.reply_token, f"Group ID: {event.source.group_id}")
-        else:
-            send_reply(event.reply_token, f"User ID: {event.source.user_id}")
+        send_reply(event.reply_token, f"Group ID: {group_id}")
+        return
 
-    elif text == '/report':
-        report = build_report()
-        send_reply(event.reply_token, report)
+    if text == '/report':
+        send_reply(event.reply_token, build_report())
+        return
 
-    elif text == '/status':
-        today = get_today()
-        data = load_json(DATA_FILE).get(today, {})
-        if not data:
-            send_reply(event.reply_token, "ยังไม่มีการส่งรูปวันนี้ครับ 📭")
-            return
-        lines = [f"📊 สถานะวันนี้ ({today})\n"]
-        for info in data.values():
-            icon = "✅" if info['count'] >= REQUIRED_PHOTOS else "⏳"
-            lines.append(f"{icon} {info['name']}: {info['count']}/{REQUIRED_PHOTOS} รูป")
-        send_reply(event.reply_token, "\n".join(lines))
+    if text == '/status':
+        send_reply(event.reply_token, build_status())
+        return
+
+    # --- ตรวจจับ Submission Format ---
+    parsed = parse_submission(text)
+    if parsed:
+        route, machine, tanks = parsed
+        name = get_user_name(user_id, group_id)
+
+        # บันทึก session ของ user นี้
+        sessions = load_json(SESSION_FILE)
+        sessions[user_id] = {
+            'route'    : route,
+            'machine'  : machine,
+            'tanks'    : tanks,
+            'name'     : name,
+            'group_id' : group_id,
+            'date'     : get_today(),
+            'count'    : 0,
+            'valid'    : 0,
+            'invalid'  : 0
+        }
+        save_json(SESSION_FILE, sessions)
+
+        send_reply(event.reply_token,
+            f"📋 รับทราบครับ {name}!\n"
+            f"🛣 สาย: {route}\n"
+            f"🤖 ตู้: {machine}\n"
+            f"💧 เติมน้ำ: {tanks} ถัง\n\n"
+            f"กรุณาส่งรูปหลักฐาน {REQUIRED_PHOTOS} รูปได้เลยครับ"
+        )
 
 
 # ============================================================
@@ -207,41 +254,66 @@ def on_image(event):
     if event.source.type != 'group':
         return
 
-    group_id = event.source.group_id
     user_id  = event.source.user_id
+    group_id = event.source.group_id
     today    = get_today()
 
-    # โหลดและอัพเดทข้อมูล
-    data = load_json(DATA_FILE)
-    if today not in data:
-        data[today] = {}
-    if user_id not in data[today]:
-        data[today][user_id] = {
-            'name'     : get_user_name(user_id, group_id),
-            'count'    : 0,
-            'valid'    : 0,
-            'invalid'  : 0,
-            'group_id' : group_id
-        }
+    # ตรวจว่า user มี session อยู่ไหม
+    sessions = load_json(SESSION_FILE)
+    session  = sessions.get(user_id)
+
+    if not session or session.get('date') != today:
+        # ไม่มี session → ให้แจ้งเตือน
+        send_reply(event.reply_token,
+            "⚠️ กรุณาพิมพ์ข้อมูลก่อนส่งรูปนะครับ\n"
+            "ตัวอย่าง: NPT1 200243 5 ถัง"
+        )
+        return
 
     # Download + วิเคราะห์รูป
     try:
         img_bytes = download_image(event.message.id)
         is_valid, _ = analyze_image(img_bytes)
 
-        data[today][user_id]['count'] += 1
+        session['count'] += 1
         if is_valid:
-            data[today][user_id]['valid'] += 1
+            session['valid'] += 1
         else:
-            data[today][user_id]['invalid'] += 1
+            session['invalid'] += 1
 
+        sessions[user_id] = session
+        save_json(SESSION_FILE, sessions)
+
+        # บันทึกลง daily data เสมอ (อัพเดทแบบ upsert)
+        data    = load_json(DATA_FILE)
+        key     = f"{user_id}_{session['route']}_{session['machine']}"
+        if today not in data:
+            data[today] = {}
+        data[today][key] = {
+            'user_id' : user_id,
+            'name'    : session['name'],
+            'route'   : session['route'],
+            'machine' : session['machine'],
+            'tanks'   : session['tanks'],
+            'count'   : session['count'],
+            'valid'   : session['valid'],
+            'invalid' : session['invalid'],
+            'group_id': group_id
+        }
         save_json(DATA_FILE, data)
 
         # แจ้งเมื่อส่งครบ
-        if data[today][user_id]['count'] == REQUIRED_PHOTOS:
-            name = data[today][user_id]['name']
+        count = session['count']
+        if count == REQUIRED_PHOTOS:
             send_reply(event.reply_token,
-                f"🎉 {name} ส่งรูปครบ {REQUIRED_PHOTOS} รูปแล้วครับ!")
+                f"🎉 {session['name']} ส่งรูปครบ {REQUIRED_PHOTOS} รูปแล้วครับ!\n"
+                f"🛣 สาย: {session['route']} | ตู้: {session['machine']}"
+            )
+        elif count % 5 == 0:
+            # แจ้งความคืบหน้าทุก 5 รูป
+            send_reply(event.reply_token,
+                f"📸 {session['name']} ส่งรูปแล้ว {count}/{REQUIRED_PHOTOS} รูป"
+            )
 
     except Exception as e:
         print(f"[ERROR] on_image: {e}")
@@ -254,35 +326,61 @@ def build_report():
     today = get_today()
     data  = load_json(DATA_FILE).get(today, {})
 
-    submitted  = []
-    pending    = []
+    if not data:
+        return f"📋 รายงานวันที่ {today}\nยังไม่มีการส่งงานวันนี้ครับ 📭"
 
-    for info in data.values():
-        if info['count'] >= REQUIRED_PHOTOS:
-            submitted.append(
-                f"[ ] {info['name']} "
-                f"({info['valid']} รูปผ่าน / {info['count']} รูปทั้งหมด)"
+    submitted = []
+    pending   = []
+
+    # จัดกลุ่มตามสาย
+    by_route = {}
+    for entry in data.values():
+        r = entry['route']
+        if r not in by_route:
+            by_route[r] = []
+        by_route[r].append(entry)
+
+    for route in sorted(by_route.keys()):
+        entries = by_route[route]
+        for e in sorted(entries, key=lambda x: x['machine']):
+            line = (
+                f"[ ] {e['name']} | ตู้ {e['machine']} | "
+                f"น้ำ {e['tanks']} ถัง | "
+                f"รูป {e['count']}/{REQUIRED_PHOTOS}"
             )
-        else:
-            pending.append(
-                f"[ ] {info['name']} "
-                f"(ส่งมา {info['count']}/{REQUIRED_PHOTOS} รูป)"
-            )
+            if e['count'] >= REQUIRED_PHOTOS:
+                submitted.append(f"✅ {line}")
+            else:
+                pending.append(f"❌ {line}")
 
     report = (
         f"📋 Task Submission Checklist\n"
         f"Task/Project Name: รูปหลักฐานการทำงาน\n"
         f"Date: {today}\n\n"
-        f"✅ Submitted ({len(submitted)} คน)\n"
+        f"✅ Submitted ({len(submitted)} รายการ)\n"
         + ("\n".join(submitted) if submitted else "(ยังไม่มี)") +
-        f"\n\n❌ Not Submitted / Pending ({len(pending)} คน)\n"
-        + ("\n".join(pending) if pending else "🎉 ทุกคนส่งครบแล้ว!") +
+        f"\n\n❌ Not Submitted / Pending ({len(pending)} รายการ)\n"
+        + ("\n".join(pending) if pending else "🎉 ทุกรายการส่งครบแล้ว!") +
         f"\n\n💡 สรุป ณ เวลา 20:00 น. | ต้องส่งครบ {REQUIRED_PHOTOS} รูป"
     )
     return report
 
+def build_status():
+    today   = get_today()
+    data    = load_json(DATA_FILE).get(today, {})
+    if not data:
+        return "ยังไม่มีการส่งงานวันนี้ครับ 📭"
+
+    lines = [f"📊 สถานะวันนี้ ({today})\n"]
+    for e in sorted(data.values(), key=lambda x: (x['route'], x['machine'])):
+        icon = "✅" if e['count'] >= REQUIRED_PHOTOS else "⏳"
+        lines.append(
+            f"{icon} {e['name']} [{e['route']}] ตู้ {e['machine']} "
+            f"— {e['count']}/{REQUIRED_PHOTOS} รูป"
+        )
+    return "\n".join(lines)
+
 def send_daily_report():
-    """ส่งรายงานไปยังทุกกลุ่มที่ Bot อยู่"""
     report = build_report()
     groups = load_json(GROUPS_FILE)
     for gid, info in groups.items():
@@ -314,7 +412,6 @@ def index():
 
 @app.route('/manual-report', methods=['GET'])
 def manual_report():
-    """เรียกรายงานด้วยมือ (ทดสอบ)"""
     send_daily_report()
     return 'Report sent! ✅'
 
