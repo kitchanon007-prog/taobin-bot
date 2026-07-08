@@ -18,7 +18,7 @@ from linebot.v3.webhooks import (
 from linebot.v3.exceptions import InvalidSignatureError
 
 # นำเข้า Library ของ Gemini แทนที่ anthropic
-import google.generativeai as genai
+import google-genai as genai
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
