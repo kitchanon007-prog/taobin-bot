@@ -16,11 +16,7 @@ from linebot.v3.webhooks import (
     TextMessageContent, JoinEvent
 )
 from linebot.v3.exceptions import InvalidSignatureError
-
-# นำเข้า SDK เวอร์ชันใหม่ล่าสุดของ Google
-from google import genai
-from google.genai import types
-
+import anthropic
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -31,10 +27,8 @@ app = Flask(__name__)
 # ============================================================
 LINE_CHANNEL_SECRET       = os.environ.get('LINE_CHANNEL_SECRET', '')
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '')
+ANTHROPIC_API_KEY         = os.environ.get('ANTHROPIC_API_KEY', '')
 REQUIRED_PHOTOS           = int(os.environ.get('REQUIRED_PHOTOS', '20'))
-
-# คีย์ของ Gemini
-GEMINI_API_KEY            = os.environ.get('GEMINI_API_KEY', '')
 
 DATA_FILE    = 'submissions.json'
 GROUPS_FILE  = 'groups.json'
@@ -45,9 +39,7 @@ SESSION_FILE = 'sessions.json'   # เก็บ session ปัจจุบัน
 # ============================================================
 handler          = WebhookHandler(LINE_CHANNEL_SECRET)
 line_config      = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
-
-# ตั้งค่า Client ของ Gemini (เวอร์ชันใหม่)
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 
 # ============================================================
@@ -70,8 +62,17 @@ def get_today():
 
 # ============================================================
 #  PARSE SUBMISSION TEXT
+#  รูปแบบ: "NPT1 200243 5 ถัง"
+#  → route=NPT1, machine=200243, tanks=5
 # ============================================================
 def parse_submission(text):
+    """
+    รูปแบบที่รองรับ:
+      NPT1 200243 5 ถัง
+      NPT1 200243 5ถัง
+      npt1 200243 5 ถัง
+    คืนค่า (route, machine, tanks) หรือ None ถ้าไม่ตรง
+    """
     pattern = r'^([A-Za-z0-9]+)\s+(\d{6})\s+(\d+)\s*ถัง'
     m = re.match(pattern, text.strip(), re.IGNORECASE)
     if m:
@@ -118,30 +119,39 @@ def send_push(to, text):
 
 
 # ============================================================
-#  IMAGE ANALYSIS (ใช้งาน Gemini API ใหม่)
+#  IMAGE ANALYSIS
 # ============================================================
 def analyze_image(image_data):
     try:
-        prompt = (
-            "ดูรูปนี้แล้วตอบว่าเป็นรูปหลักฐานการทำงาน "
-            "(เช่น ตู้กาแฟ สินค้า หน้าร้าน การเติมน้ำ งานภาคสนาม) หรือไม่? "
-            "ตอบแค่ YES หรือ NO ตามด้วยเหตุผลสั้น 1 ประโยคเป็นภาษาไทย"
+        img_b64 = base64.standard_b64encode(image_data).decode('utf-8')
+        msg = anthropic_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=200,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": img_b64
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            "ดูรูปนี้แล้วตอบว่าเป็นรูปหลักฐานการทำงาน "
+                            "(เช่น ตู้กาแฟ สินค้า หน้าร้าน การเติมน้ำ งานภาคสนาม) หรือไม่? "
+                            "ตอบแค่ YES หรือ NO ตามด้วยเหตุผลสั้น 1 ประโยคเป็นภาษาไทย"
+                        )
+                    }
+                ]
+            }]
         )
-        
-        # ส่งให้ Gemini ประมวลผลด้วยรูปแบบคำสั่งของ google-genai
-        response = gemini_client.models.generate_content(
-            model='gemini-1.5-flash',
-            contents=[
-                prompt,
-                types.Part.from_bytes(data=image_data, mime_type='image/jpeg')
-            ]
-        )
-        result = response.text.strip()
-        print(f"[GEMINI SUCCESS]: {result}")
-        
+        result = msg.content[0].text.strip()
         return result.upper().startswith('YES'), result
     except Exception as e:
-        print(f"[GEMINI ERROR]: {e}")
         return True, f"วิเคราะห์ไม่ได้: {e}"
 
 
@@ -193,6 +203,7 @@ def on_text(event):
     user_id  = event.source.user_id
     group_id = event.source.group_id
 
+    # --- Commands ---
     if text == '/id':
         send_reply(event.reply_token, f"Group ID: {group_id}")
         return
@@ -205,31 +216,40 @@ def on_text(event):
         send_reply(event.reply_token, build_status())
         return
 
+    # --- ตรวจจับ Submission Format ---
     parsed = parse_submission(text)
     if parsed:
         route, machine, tanks = parsed
         name = get_user_name(user_id, group_id)
 
+        # เพิ่มเข้า Queue ของ user นี้ (ไม่ Overwrite)
         sessions = load_json(SESSION_FILE)
-        sessions[user_id] = {
-            'route'    : route,
-            'machine'  : machine,
-            'tanks'    : tanks,
-            'name'     : name,
-            'group_id' : group_id,
-            'date'     : get_today(),
-            'count'    : 0,
-            'valid'    : 0,
-            'invalid'  : 0
-        }
+        if user_id not in sessions or sessions[user_id].get('date') != get_today():
+            sessions[user_id] = {
+                'name'     : name,
+                'group_id' : group_id,
+                'date'     : get_today(),
+                'queue'    : []   # รายการตู้ที่รอส่งรูป
+            }
+
+        sessions[user_id]['queue'].append({
+            'route'   : route,
+            'machine' : machine,
+            'tanks'   : tanks,
+            'count'   : 0,
+            'valid'   : 0,
+            'invalid' : 0
+        })
         save_json(SESSION_FILE, sessions)
 
+        queue_len = len(sessions[user_id]['queue'])
         send_reply(event.reply_token,
             f"📋 รับทราบครับ {name}!\n"
             f"🛣 สาย: {route}\n"
             f"🤖 ตู้: {machine}\n"
             f"💧 เติมน้ำ: {tanks} ถัง\n\n"
             f"กรุณาส่งรูปหลักฐาน {REQUIRED_PHOTOS} รูปได้เลยครับ"
+            + (f"\n📌 มีตู้รอส่งรูปอีก {queue_len} ตู้" if queue_len > 1 else "")
         )
 
 
@@ -245,55 +265,89 @@ def on_image(event):
     group_id = event.source.group_id
     today    = get_today()
 
+    # ตรวจว่า user มี queue อยู่ไหม
     sessions = load_json(SESSION_FILE)
-    session  = sessions.get(user_id)
+    user_data = sessions.get(user_id)
 
-    if not session or session.get('date') != today:
+    if not user_data or user_data.get('date') != today or not user_data.get('queue'):
         send_reply(event.reply_token,
             "⚠️ กรุณาพิมพ์ข้อมูลก่อนส่งรูปนะครับ\n"
             "ตัวอย่าง: NPT1 200243 5 ถัง"
         )
         return
 
+    # หา Session แรกใน Queue ที่ยังไม่ครบ
+    current = None
+    current_idx = None
+    for i, s in enumerate(user_data['queue']):
+        if s['count'] < REQUIRED_PHOTOS:
+            current = s
+            current_idx = i
+            break
+
+    if current is None:
+        send_reply(event.reply_token,
+            "✅ ส่งรูปครบทุกตู้แล้วครับ!\n"
+            "ถ้ามีตู้ใหม่ พิมพ์ข้อมูลตู้ใหม่ได้เลยครับ"
+        )
+        return
+
+    # Download + วิเคราะห์รูป
     try:
         img_bytes = download_image(event.message.id)
         is_valid, _ = analyze_image(img_bytes)
 
-        session['count'] += 1
+        current['count'] += 1
         if is_valid:
-            session['valid'] += 1
+            current['valid'] += 1
         else:
-            session['invalid'] += 1
+            current['invalid'] += 1
 
-        sessions[user_id] = session
+        user_data['queue'][current_idx] = current
+        sessions[user_id] = user_data
         save_json(SESSION_FILE, sessions)
 
-        data    = load_json(DATA_FILE)
-        key     = f"{user_id}_{session['route']}_{session['machine']}"
+        # บันทึกลง daily data
+        data = load_json(DATA_FILE)
+        key  = f"{user_id}_{current['route']}_{current['machine']}"
         if today not in data:
             data[today] = {}
         data[today][key] = {
             'user_id' : user_id,
-            'name'    : session['name'],
-            'route'   : session['route'],
-            'machine' : session['machine'],
-            'tanks'   : session['tanks'],
-            'count'   : session['count'],
-            'valid'   : session['valid'],
-            'invalid' : session['invalid'],
+            'name'    : user_data['name'],
+            'route'   : current['route'],
+            'machine' : current['machine'],
+            'tanks'   : current['tanks'],
+            'count'   : current['count'],
+            'valid'   : current['valid'],
+            'invalid' : current['invalid'],
             'group_id': group_id
         }
         save_json(DATA_FILE, data)
 
-        count = session['count']
+        count = current['count']
+        name  = user_data['name']
+
+        # แจ้งเมื่อส่งครบ
         if count == REQUIRED_PHOTOS:
-            send_reply(event.reply_token,
-                f"🎉 {session['name']} ส่งรูปครบ {REQUIRED_PHOTOS} รูปแล้วครับ!\n"
-                f"🛣 สาย: {session['route']} | ตู้: {session['machine']}"
+            # เช็คว่ามีตู้ถัดไปใน Queue ไหม
+            next_sessions = [s for s in user_data['queue'] if s['count'] < REQUIRED_PHOTOS]
+            msg = (
+                f"🎉 {name} ส่งรูปครบ {REQUIRED_PHOTOS} รูปแล้วครับ!\n"
+                f"🛣 สาย: {current['route']} | ตู้: {current['machine']}"
             )
+            if next_sessions:
+                nxt = next_sessions[0]
+                msg += (
+                    f"\n\n📌 ตู้ถัดไป: {nxt['machine']} (สาย {nxt['route']})\n"
+                    f"กรุณาส่งรูปหลักฐาน {REQUIRED_PHOTOS} รูปได้เลยครับ"
+                )
+            send_reply(event.reply_token, msg)
+
         elif count % 5 == 0:
             send_reply(event.reply_token,
-                f"📸 {session['name']} ส่งรูปแล้ว {count}/{REQUIRED_PHOTOS} รูป"
+                f"📸 {name} ส่งรูปแล้ว {count}/{REQUIRED_PHOTOS} รูป\n"
+                f"(ตู้ {current['machine']} สาย {current['route']})"
             )
 
     except Exception as e:
@@ -313,6 +367,7 @@ def build_report():
     submitted = []
     pending   = []
 
+    # จัดกลุ่มตามสาย
     by_route = {}
     for entry in data.values():
         r = entry['route']
@@ -373,7 +428,7 @@ def send_daily_report():
 
 
 # ============================================================
-#  SCHEDULER
+#  SCHEDULER — 20:00 ทุกวัน (Bangkok Time)
 # ============================================================
 scheduler = BackgroundScheduler(timezone='Asia/Bangkok')
 scheduler.add_job(
