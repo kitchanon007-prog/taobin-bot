@@ -17,8 +17,9 @@ from linebot.v3.webhooks import (
 )
 from linebot.v3.exceptions import InvalidSignatureError
 
-# นำเข้า Library ของ Gemini แทนที่ anthropic
-import google-genai as genai
+# นำเข้า SDK เวอร์ชันใหม่ล่าสุดของ Google
+from google import genai
+from google.genai import types
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -32,7 +33,7 @@ LINE_CHANNEL_SECRET       = os.environ.get('LINE_CHANNEL_SECRET', '')
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '')
 REQUIRED_PHOTOS           = int(os.environ.get('REQUIRED_PHOTOS', '20'))
 
-# เปลี่ยนจาก ANTHROPIC_API_KEY เป็น GEMINI_API_KEY
+# คีย์ของ Gemini
 GEMINI_API_KEY            = os.environ.get('GEMINI_API_KEY', '')
 
 DATA_FILE    = 'submissions.json'
@@ -45,9 +46,8 @@ SESSION_FILE = 'sessions.json'   # เก็บ session ปัจจุบัน
 handler          = WebhookHandler(LINE_CHANNEL_SECRET)
 line_config      = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 
-# ตั้งค่าการใช้งาน Gemini
-genai.configure(api_key=GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+# ตั้งค่า Client ของ Gemini (เวอร์ชันใหม่)
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 
 # ============================================================
@@ -70,8 +70,6 @@ def get_today():
 
 # ============================================================
 #  PARSE SUBMISSION TEXT
-#  รูปแบบ: "NPT1 200243 5 ถัง"
-#  → route=NPT1, machine=200243, tanks=5
 # ============================================================
 def parse_submission(text):
     pattern = r'^([A-Za-z0-9]+)\s+(\d{6})\s+(\d+)\s*ถัง'
@@ -120,31 +118,30 @@ def send_push(to, text):
 
 
 # ============================================================
-#  IMAGE ANALYSIS (ใช้งาน Gemini API)
+#  IMAGE ANALYSIS (ใช้งาน Gemini API ใหม่)
 # ============================================================
 def analyze_image(image_data):
     try:
-        # เตรียมข้อมูลรูปภาพส่งให้ Gemini
-        image_parts = [
-            {
-                "mime_type": "image/jpeg",
-                "data": image_data
-            }
-        ]
-        
-        # คำสั่งให้บอทตรวจสอบ
         prompt = (
             "ดูรูปนี้แล้วตอบว่าเป็นรูปหลักฐานการทำงาน "
             "(เช่น ตู้กาแฟ สินค้า หน้าร้าน การเติมน้ำ งานภาคสนาม) หรือไม่? "
             "ตอบแค่ YES หรือ NO ตามด้วยเหตุผลสั้น 1 ประโยคเป็นภาษาไทย"
         )
         
-        # ส่งให้ Gemini ประมวลผล
-        response = gemini_model.generate_content([prompt, image_parts[0]])
+        # ส่งให้ Gemini ประมวลผลด้วยรูปแบบคำสั่งของ google-genai
+        response = gemini_client.models.generate_content(
+            model='gemini-1.5-flash',
+            contents=[
+                prompt,
+                types.Part.from_bytes(data=image_data, mime_type='image/jpeg')
+            ]
+        )
         result = response.text.strip()
+        print(f"[GEMINI SUCCESS]: {result}")
         
         return result.upper().startswith('YES'), result
     except Exception as e:
+        print(f"[GEMINI ERROR]: {e}")
         return True, f"วิเคราะห์ไม่ได้: {e}"
 
 
