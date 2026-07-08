@@ -16,7 +16,10 @@ from linebot.v3.webhooks import (
     TextMessageContent, JoinEvent
 )
 from linebot.v3.exceptions import InvalidSignatureError
-import anthropic
+
+# นำเข้า Library ของ Gemini แทนที่ anthropic
+import google.generativeai as genai
+
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -27,8 +30,10 @@ app = Flask(__name__)
 # ============================================================
 LINE_CHANNEL_SECRET       = os.environ.get('LINE_CHANNEL_SECRET', '')
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '')
-ANTHROPIC_API_KEY         = os.environ.get('ANTHROPIC_API_KEY', '')
 REQUIRED_PHOTOS           = int(os.environ.get('REQUIRED_PHOTOS', '20'))
+
+# เปลี่ยนจาก ANTHROPIC_API_KEY เป็น GEMINI_API_KEY
+GEMINI_API_KEY            = os.environ.get('GEMINI_API_KEY', '')
 
 DATA_FILE    = 'submissions.json'
 GROUPS_FILE  = 'groups.json'
@@ -39,7 +44,10 @@ SESSION_FILE = 'sessions.json'   # เก็บ session ปัจจุบัน
 # ============================================================
 handler          = WebhookHandler(LINE_CHANNEL_SECRET)
 line_config      = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
-anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+# ตั้งค่าการใช้งาน Gemini
+genai.configure(api_key=GEMINI_API_KEY)
+gemini_model = genai.GenerativeModel('gemini-1.5-flash')
 
 
 # ============================================================
@@ -66,13 +74,6 @@ def get_today():
 #  → route=NPT1, machine=200243, tanks=5
 # ============================================================
 def parse_submission(text):
-    """
-    รูปแบบที่รองรับ:
-      NPT1 200243 5 ถัง
-      NPT1 200243 5ถัง
-      npt1 200243 5 ถัง
-    คืนค่า (route, machine, tanks) หรือ None ถ้าไม่ตรง
-    """
     pattern = r'^([A-Za-z0-9]+)\s+(\d{6})\s+(\d+)\s*ถัง'
     m = re.match(pattern, text.strip(), re.IGNORECASE)
     if m:
@@ -119,37 +120,29 @@ def send_push(to, text):
 
 
 # ============================================================
-#  IMAGE ANALYSIS
+#  IMAGE ANALYSIS (ใช้งาน Gemini API)
 # ============================================================
 def analyze_image(image_data):
     try:
-        img_b64 = base64.standard_b64encode(image_data).decode('utf-8')
-        msg = anthropic_client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=200,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/jpeg",
-                            "data": img_b64
-                        }
-                    },
-                    {
-                        "type": "text",
-                        "text": (
-                            "ดูรูปนี้แล้วตอบว่าเป็นรูปหลักฐานการทำงาน "
-                            "(เช่น ตู้กาแฟ สินค้า หน้าร้าน การเติมน้ำ งานภาคสนาม) หรือไม่? "
-                            "ตอบแค่ YES หรือ NO ตามด้วยเหตุผลสั้น 1 ประโยคเป็นภาษาไทย"
-                        )
-                    }
-                ]
-            }]
+        # เตรียมข้อมูลรูปภาพส่งให้ Gemini
+        image_parts = [
+            {
+                "mime_type": "image/jpeg",
+                "data": image_data
+            }
+        ]
+        
+        # คำสั่งให้บอทตรวจสอบ
+        prompt = (
+            "ดูรูปนี้แล้วตอบว่าเป็นรูปหลักฐานการทำงาน "
+            "(เช่น ตู้กาแฟ สินค้า หน้าร้าน การเติมน้ำ งานภาคสนาม) หรือไม่? "
+            "ตอบแค่ YES หรือ NO ตามด้วยเหตุผลสั้น 1 ประโยคเป็นภาษาไทย"
         )
-        result = msg.content[0].text.strip()
+        
+        # ส่งให้ Gemini ประมวลผล
+        response = gemini_model.generate_content([prompt, image_parts[0]])
+        result = response.text.strip()
+        
         return result.upper().startswith('YES'), result
     except Exception as e:
         return True, f"วิเคราะห์ไม่ได้: {e}"
@@ -203,7 +196,6 @@ def on_text(event):
     user_id  = event.source.user_id
     group_id = event.source.group_id
 
-    # --- Commands ---
     if text == '/id':
         send_reply(event.reply_token, f"Group ID: {group_id}")
         return
@@ -216,13 +208,11 @@ def on_text(event):
         send_reply(event.reply_token, build_status())
         return
 
-    # --- ตรวจจับ Submission Format ---
     parsed = parse_submission(text)
     if parsed:
         route, machine, tanks = parsed
         name = get_user_name(user_id, group_id)
 
-        # บันทึก session ของ user นี้
         sessions = load_json(SESSION_FILE)
         sessions[user_id] = {
             'route'    : route,
@@ -258,19 +248,16 @@ def on_image(event):
     group_id = event.source.group_id
     today    = get_today()
 
-    # ตรวจว่า user มี session อยู่ไหม
     sessions = load_json(SESSION_FILE)
     session  = sessions.get(user_id)
 
     if not session or session.get('date') != today:
-        # ไม่มี session → ให้แจ้งเตือน
         send_reply(event.reply_token,
             "⚠️ กรุณาพิมพ์ข้อมูลก่อนส่งรูปนะครับ\n"
             "ตัวอย่าง: NPT1 200243 5 ถัง"
         )
         return
 
-    # Download + วิเคราะห์รูป
     try:
         img_bytes = download_image(event.message.id)
         is_valid, _ = analyze_image(img_bytes)
@@ -284,7 +271,6 @@ def on_image(event):
         sessions[user_id] = session
         save_json(SESSION_FILE, sessions)
 
-        # บันทึกลง daily data เสมอ (อัพเดทแบบ upsert)
         data    = load_json(DATA_FILE)
         key     = f"{user_id}_{session['route']}_{session['machine']}"
         if today not in data:
@@ -302,7 +288,6 @@ def on_image(event):
         }
         save_json(DATA_FILE, data)
 
-        # แจ้งเมื่อส่งครบ
         count = session['count']
         if count == REQUIRED_PHOTOS:
             send_reply(event.reply_token,
@@ -310,7 +295,6 @@ def on_image(event):
                 f"🛣 สาย: {session['route']} | ตู้: {session['machine']}"
             )
         elif count % 5 == 0:
-            # แจ้งความคืบหน้าทุก 5 รูป
             send_reply(event.reply_token,
                 f"📸 {session['name']} ส่งรูปแล้ว {count}/{REQUIRED_PHOTOS} รูป"
             )
@@ -332,7 +316,6 @@ def build_report():
     submitted = []
     pending   = []
 
-    # จัดกลุ่มตามสาย
     by_route = {}
     for entry in data.values():
         r = entry['route']
@@ -393,7 +376,7 @@ def send_daily_report():
 
 
 # ============================================================
-#  SCHEDULER — 20:00 ทุกวัน (Bangkok Time)
+#  SCHEDULER
 # ============================================================
 scheduler = BackgroundScheduler(timezone='Asia/Bangkok')
 scheduler.add_job(
